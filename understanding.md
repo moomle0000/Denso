@@ -1,8 +1,33 @@
 # Understanding the Denso 89257-30080 PWM Input
 
 Notes from a forum / photo analysis of how the module is wired and driven
-in real aftermarket installations. This explains the wiring and logic so
-the schematic in `plan.md` and `diagram.png` makes sense.
+in real aftermarket installations, plus notes from a YouTube walk-through
+on using OE-style brushless radiator-fan controllers (Denso, Hitachi, etc.)
+with aftermarket ECUs like Megasquirt and Holley. This explains the wiring
+and logic so the schematic in `plan.md` and `diagram.png` makes sense.
+
+---
+
+## 0. Background — OE Brushless Fan Modules
+
+These OE-style brushless radiator-fan controllers (the Denso family that
+includes our 89257-30080, plus Hitachi and Mitsubishi units used in
+Infiniti / Mitsubishi / some Tesla applications) are a popular option for
+custom builds because they are:
+
+- **Reliable** — OE-grade design, typically 30 A+ continuous.
+- **Cheap** — used units are usually $20–$50 on eBay.
+- **Compact** — much smaller than a discrete MOSFET + relay + shroud.
+- **Drop-in** — they already include the reverse-battery, over-current
+  and thermal protection that a hand-rolled solution would need.
+
+**Buy the silver-cased version, not the older black-cased one.** The
+black-cases have a well-documented history of reliability issues and
+recalls, especially on early 2000s vehicles. The silver-case revisions
+are the reliable generations.
+
+The 89257-30080 is in the silver-case family, so it is the variant we
+want.
 
 ---
 
@@ -147,7 +172,114 @@ sure is to measure it directly before committing to a wiring plan:
 This gives you a wiring and firmware setup **confirmed for your exact
 module** rather than inferred from generic reverse-engineering notes.
 
-## 8. Summary
+---
+
+## 8. Signal Details (per video walk-through)
+
+The Infiniti / Mitsubishi / Denso family of OE brushless fan modules
+(including our 89257-30080) all rely entirely on an **external PWM
+signal** for fan-speed control. They do not read a temperature sensor
+themselves; whatever duty cycle you feed the middle pin is the speed
+the fan will run at.
+
+### 8.1 Core signal requirements
+
+| Item              | Value / range                                            |
+| ----------------- | -------------------------------------------------------- |
+| Signal type       | PWM, constant frequency, variable duty cycle             |
+| Frequency tested  | **200 Hz – 600 Hz** works reliably                        |
+| Frequency (wide)  | ~50 Hz to ~4 kHz (per other reverse-engineering sources) |
+| Duty cycle range  | 0 % – 100 % (mapping depends on switching style; see below) |
+
+Our `src/main.cpp` uses **3,921 Hz** which is well inside the working
+range and matches the canonical Megasquirt / Holley auxiliary PWM
+frequency. If you see fan buzzing, drop the frequency into the
+200–600 Hz sweet spot.
+
+### 8.2 Wiring
+
+**Input plug (3 wires):**
+- +12 V (battery + via fuse)
+- GND (chassis)
+- PWM signal (center pin)
+
+**Output (two leads):** go directly to the brushless radiator fan. Wire
+colors are **non-standard** on aftermarket harnesses — red is sometimes
+ground, sometimes +. Always identify the fan motor's own + and − before
+connecting.
+
+### 8.3 ⚠️ Polarity-sensitivity (will brick the module)
+
+These modules are **extremely polarity-sensitive**. Reversing the +12 V
+and GND leads **permanently destroys** the unit — there is no fuse
+inside that will save it. Double-check with a multimeter before applying
+power. A common workflow:
+
+1. With battery disconnected, identify each pin on the harness with a
+   continuity / voltage test.
+2. Connect GND first, then +12 V (with fuse), and verify the module
+   doesn't get hot or draw current.
+3. Only then connect the PWM signal.
+
+### 8.4 Fail-safe → use a relay on the main power feed
+
+Because the module defaults to **full speed when the PWM signal is lost
+or the wire breaks**, leaving +12 V permanently connected means the fan
+will run flat-out as soon as the fuse is live, even with the engine off
+and the key out. This will:
+
+- Drain the battery.
+- Cook the engine bay if the car is parked.
+- Mask wiring faults (you can't tell if the PWM is "off" or "broken").
+
+**Best practice:** put the module's +12 V feed on a **relay** that is
+energized only when the ignition / ECU is on. That way:
+
+- Key off → relay open → module unpowered → fan cannot run.
+- Key on, PWM wire broken → relay still closed, module still powered,
+  fan runs at 100 % (the fail-safe still works as designed).
+
+This is one of the most important things the video calls out and it
+applies directly to the 89257-30080.
+
+### 8.5 High-side vs low-side switching
+
+The module accepts **both** styles, depending on your ECU's output
+stage. The two are not interchangeable in firmware — the duty-cycle
+meaning is reversed between them.
+
+| Style             | Used by                              | "Off" state duty | "On" state duty |
+| ----------------- | ------------------------------------ | ---------------- | --------------- |
+| **High-side**     | Cheap Amazon / generic fan controllers | 0–20 %           | 20 %+           |
+| **Low-side**      | Megasquirt, Holley, most ECUs        | **80–100 %**     | below 80 %      |
+
+Because the Denso 89257-30080 is "off at 100 % duty, on at 0 % duty" in
+our bench data, our setup is the **low-side / open-drain** style. If
+you switch to a high-side controller later, the duty in firmware will
+need to be inverted again (or you set TunerStudio / Holley to invert
+the output channel).
+
+### 8.6 Practical demonstration (from the video)
+
+For an MS3X in TunerStudio, the fan output is mapped by:
+
+1. Pick an unused PWM output (e.g. **SPARE_PWM_1**).
+2. Set the frequency to **3906 Hz** (the Megasquirt default auxiliary
+   PWM frequency; our 3921 Hz is a 0.4 % drift, the module doesn't
+   care).
+3. Set the duty range to **100 % = off, 0 % = full** (i.e. invert).
+4. Link the duty to **engine coolant temperature** with a curve:
+   - ≤ 40 °C → 100 % duty (fan off)
+   - 80 °C → 0 % duty (fan full)
+   - Linear in between
+
+This matches what `test/test_temp_control/test_temp_control.cpp`
+does in firmware: `TEMP_START_C = 40`, `TEMP_FULL_C = 80`, with
+hysteresis around the start threshold.
+
+---
+
+## 9. Summary
 
 | Item                          | Value / Behavior                              |
 | ----------------------------- | --------------------------------------------- |
@@ -155,10 +287,12 @@ module** rather than inferred from generic reverse-engineering notes.
 | Fan motor pins                | Two small 2-pin connectors — *do not touch*   |
 | Required interface            | **Open-drain** (2N2222, 2N7002, or PC817)     |
 | Logic                         | **Inverted** (0% duty = 100% fan)             |
-| Frequency                     | 100 Hz – 4 kHz; **3.9 kHz** is a good default |
+| Switching style               | **Low-side** (matches Megasquirt / Holley)    |
+| Frequency                     | 200 Hz – 4 kHz; **3.9 kHz** is a good default |
 | Fail-safe                     | Disconnected wire → fan at 100%               |
-| Module +12 V supply           | Pin 3 (right), fused 30 A                     |
+| Module +12 V supply           | Pin 3 (right), fused 30 A → **via relay**     |
 | Module GND                    | Pin 1 (left), chassis                         |
+| Polarity                      | **Strict** — reverse +12 V / GND bricks it    |
 
 ## 9. Files in This Repo
 
@@ -167,4 +301,7 @@ module** rather than inferred from generic reverse-engineering notes.
 - `plan.md` — full project plan
 - `src/main.cpp` — Arduino Uno PWM generator (3.9 kHz, inverse logic)
 - `src/pwm_reader.cpp` — `pulseIn`-based PWM reader sketch
+- `test/test_temp_control/test_temp_control.cpp` — temperature-driven fan
+  control (DS18B20 → fan duty, 40–80 °C map, hysteresis)
+- `platformio.ini` — Uno env, links DallasTemperature + OneWire libs
 - `AGENTS.md` — repo conventions for future agents
